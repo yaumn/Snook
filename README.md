@@ -1,5 +1,5 @@
 # Snook
-Enhanced PowerShell reverse shell with python listener
+Enhanced PowerShell reverse shell with python listener. This work was inspired by [Evil-WinRM](https://github.com/Hackplayers/evil-winrm) and [Nishang's PowerShell reverse shell](https://github.com/samratashok/nishang/blob/master/Shells/Invoke-PowerShellTcp.ps1).
 
 ## Dependencies
 
@@ -31,5 +31,6 @@ Then run the reverse shell on the remote machine:
 ## TODO
 
 - Add file logging
+- Implement tab completion for file path
 - Add new cool features
 - Check if reverse shell is compatible with other PS versions
