@@ -6,7 +6,7 @@ from base64 import b64decode, b64encode
 from cmd import Cmd
 from json import dumps, JSONDecodeError, loads
 import logging
-from os.path import getsize, isdir, join
+from os.path import abspath, getsize, isdir, join
 from ntpath import basename
 import socket
 import sys
@@ -158,7 +158,7 @@ class Prompt(Cmd):
                     received_bytes += len(data)
                     bar(incr=len(data))
 
-        self.print_message('File successfully saved to {}'.format(file_path))
+        self.print_message('File successfully saved to {}'.format(abspath(file_path)))
 
     def handle_upload(self, packet):
         if packet.error:
@@ -172,11 +172,16 @@ class Prompt(Cmd):
                 while True:
                     data = f.read(1024)
                     if not data:
-                        return self.do_exit()
+                        break
                     self.sock.send(data)
                     bar(incr=len(data))
 
-        self.print_message('File successfully uploaded')
+
+        p = self.receive_json_packet()
+        if not isinstance(p, Packet):
+            return p
+
+        self.print_message('File successfully uploaded to {}'.format(p.message))
 
     @staticmethod
     def print_color(text, color):
@@ -192,7 +197,9 @@ class Prompt(Cmd):
     def print_warning(self, text):
         self.print_color(text, Fore.YELLOW)
 
-    def receive_loop(self):
+    def receive_json_packet(self):
+        # TODO: Find a better mechanism for this function that can
+        # return a Packet, True or None
         response = ''
         while True:
             data = self.sock.recv(1024)
@@ -206,9 +213,16 @@ class Prompt(Cmd):
                 continue
             except Exception as e:
                 print('An unexcepted error happened:', e)
-                return
+                return None
 
             break
+
+        return p
+
+    def receive_loop(self):
+        p = self.receive_json_packet()
+        if not isinstance(p, Packet):
+            return p
 
         try:
             f = getattr(self, 'handle_' + p.action)
