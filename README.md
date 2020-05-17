@@ -2,7 +2,7 @@
 
 Enhanced PowerShell/bash reverse shell with python listener. This work was inspired by [Evil-WinRM](https://github.com/Hackplayers/evil-winrm) and [Nishang's PowerShell reverse shell](https://github.com/samratashok/nishang/blob/master/Shells/Invoke-PowerShellTcp.ps1).
 This is a cool tool for CTF boxes as the reverse shells are coded in a scripting language that will surely be available on the boxes, therefore they won't be dependency problems.
-Feel free to suggest or implement new commands!
+Feel free to suggest or implement new builtin commands!
 
 ## Dependencies
 
@@ -22,8 +22,8 @@ The bash reverse shell has only been tested on bash 5.0.16
 - Execute commands
 - Download a file from the remote host
 - Upload a file to the remote host
-- Communication encryption (only available with the bash reverse shell at the moment)
-- Fully interactive mode (only available with the bash reverse shell at the moment)
+- Communication encryption
+- Fully interactive mode (only available on the bash reverse shell at the moment)
 
 ## Usage
 
@@ -39,11 +39,29 @@ or
 
 `./snook.sh <IP> <PORT>` (on Linux)
 
+Then on the listener, type whatever command you want. Any command that is not a listener's builtin command will be interpreted as a Powershell/Bash command.
+
+Here is a list of the special builtin commands available on the listener:
+
+### Download
+
+You can download a file from the remote host by typing `download -d <local_destination> <remote_file>`.
+Cool tip: there is autocompletion on the local destination parameter.
+
+### Upload
+
+You can upload a file on the remote host by typing `upload -d <remote_destination> <local_file>`.
+Cool tip: there is autocompletion on the local file parameter.
+
+### Interactive (only on the Bash reverse shell for the moment)
+
+Juste type `interactive` and you get a fully interactive tty shell, really useful if you need to run commands like sudo.
+
 ## TODO
 
-- Implement communication encryption for the PS reverse shell
+- Better handling of encryption setup errors
 - Implement fully interactive mode for the PS reverse shell
-- Add an encrypt command with on/off switch
+- Implement download/upload of directories
 - Add new cool features
 - Check if the Powershell reverse shell is compatible with other PS versions
 - Check if the bash reverse shell is compatible with other bash versions
