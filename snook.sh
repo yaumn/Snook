@@ -142,7 +142,7 @@ which openssl 2>&1 >/dev/null
 
 
 hello_message='{"action": "hello", "args": {"features": ["download", "encrypt",
-    "interactive", "upload"], "encryption": {"supported": '$encryption_supported',
+    "interactive", "upload"], "os": "Linux", "encryption": {"supported": '$encryption_supported',
     "enabled": '$encryption_supported
 
 if [ "$encryption_supported" == 'true' ]; then
