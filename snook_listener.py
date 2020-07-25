@@ -50,7 +50,7 @@ class Packet():
         self.message = None
         self.warning = None
         self.error = None
-        self.path = None
+        self.prompt = None
 
     def add_argument(self, name: str, value, base64_enc: bool=True) -> None:
         if isinstance(value, str) and base64_enc:
